@@ -30,13 +30,10 @@ jobs:
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
         run: |
-          python main.py | tee run.log
-          ART=$(grep -o 'ARTIFACT_PATH::.*' run.log | sed 's/ARTIFACT_PATH:://')
-          echo "CSV=$ART" >> $GITHUB_ENV
+          python main.py
 
       - name: Upload CSV artifact
-        if: env.CSV != ''
         uses: actions/upload-artifact@v4
         with:
           name: proveedor_csv
-          path: ${{ env.CSV }}
+          path: proveedor_extracted.csv
