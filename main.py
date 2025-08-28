@@ -5,9 +5,9 @@ import tempfile
 import requests
 import pandas as pd
 
-# --- Dependencias externas ---
-import tabula            # pip install tabula-py  (requiere Java instalado)
-import gspread           # pip install gspread
+# --- libs externas ---
+import tabula              # tabula-py (requiere Java)
+import gspread             # gspread + google-auth
 from google.oauth2.service_account import Credentials
 
 # =================== CONFIG ===================
@@ -112,7 +112,6 @@ def read_all_tables(pdf_path):
 def parse_rows(dfs):
     rows = []
     for df in dfs:
-        # Normalizamos todas las celdas a texto "limpio"
         df = df.applymap(tidy_text)
 
         for _, r in df.iterrows():
@@ -147,13 +146,10 @@ def parse_rows(dfs):
                     desc = re.sub(r"\s+\d[\d.,]*$", "", desc).strip()
 
             if price is None:
-                # no hay forma segura → saltar fila
                 continue
 
             unit = extract_unit(desc)
-            # limpiar “.00” colgando en descripción
-            desc = re.sub(r"\s+[.,]00\b", "", desc)
-
+            desc = re.sub(r"\s+[.,]00\b", "", desc)  # limpia “.00” colgando
             rows.append([code, desc, unit, int(round(price))])
 
     # de-duplicar manteniendo el primero
@@ -196,8 +192,12 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         pdf_path = os.path.join(tmp, "lista.pdf")
         download_pdf(pdf_path)
+
         dfs = read_all_tables(pdf_path)
+        print(f"[INFO] TABLAS_ENCONTRADAS={len(dfs)}")
+
         rows = parse_rows(dfs)
+        print(f"[INFO] FILAS_FINAL={len(rows)}")
 
         # ordenar por código asc (numéricos primero)
         def code_key(c):
@@ -207,14 +207,17 @@ def main():
                 return 10**9
         rows.sort(key=lambda r: (code_key(r[0]), r[1]))
 
-        # CSV de respaldo para auditar en GitHub Actions
-        csv_path = os.path.join(tmp, "extracted.csv")
-        pd.DataFrame(rows, columns=["codigo","descripcion","presentacion","precio_final"]).to_csv(csv_path, index=False)
+        # CSV de respaldo en el workspace del repo (para Actions)
+        workspace = os.getenv("GITHUB_WORKSPACE", os.getcwd())
+        csv_path = os.path.join(workspace, "proveedor_extracted.csv")
+        pd.DataFrame(
+            rows,
+            columns=["codigo","descripcion","presentacion","precio_final"]
+        ).to_csv(csv_path, index=False, encoding="utf-8")
+        print(f"[INFO] CSV_SAVED={csv_path}")
 
         write_to_sheet(rows, creds)
 
-        # indicamos al workflow dónde quedó el CSV
-        print(f"ARTIFACT_PATH::{csv_path}")
-
 if __name__ == "__main__":
     main()
+
