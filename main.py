@@ -26,17 +26,14 @@ UNITS_RE = re.compile(r"\b(\d{1,4})\s*(ml|cc|l|lt|lts|litro?s?|kg|g)\b", re.I)
 PACK_RE  = re.compile(r"x\s*\d+\s*u", re.I)
 
 def tidy_text(x: object) -> str:
-    """Normaliza texto de celdas (quita saltos, packs, espacios extras)."""
     if x is None or (isinstance(x, float) and pd.isna(x)):
         return ""
-    s = str(x)
-    s = s.replace("\n", " ")
-    s = PACK_RE.sub("", s)            # saca "x5u" de los textos
+    s = str(x).replace("\n", " ")
+    s = PACK_RE.sub("", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
 def normalize_price(x: object):
-    """Convierte valores a número; descarta ruidos (<100)."""
     if x is None or (isinstance(x, float) and pd.isna(x)):
         return None
     s = str(x).strip()
@@ -49,12 +46,11 @@ def normalize_price(x: object):
         return None
     try:
         v = float(s)
-        return v if v >= 100 else None             # descartar 1, 7, .00, etc.
+        return v if v >= 100 else None
     except Exception:
         return None
 
 def last_price_in_row(cells):
-    """Toma el ÚLTIMO candidato de precio creíble en la fila."""
     vals = []
     for c in cells:
         v = normalize_price(c)
@@ -73,33 +69,32 @@ def extract_unit(text: str) -> str:
         u = "lt"
     return f"{n} {u}"
 
-# ============== GOOGLE CREDS / DESCARGA ==============
 def load_creds():
-    """Lee el JSON del Service Account desde el secreto de GitHub."""
-    sa_json = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
+    sa_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+    if not sa_json:
+        raise SystemExit("[ERROR] Falta el secreto GOOGLE_SERVICE_ACCOUNT_JSON")
     creds_info = json.loads(sa_json)
     creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
     return creds
 
 def download_pdf(path):
+    print(f"[INFO] Descargando PDF desde {PDF_URL}")
     r = requests.get(PDF_URL, timeout=60)
     r.raise_for_status()
     with open(path, "wb") as f:
         f.write(r.content)
+    print("[INFO] PDF descargado OK")
 
-# ============== LECTURA DE TABLAS ==============
 def read_all_tables(pdf_path):
-    """Extrae TODAS las tablas de todas las páginas (lattice + stream)."""
     dfs = []
     try:
         dfs += tabula.read_pdf(pdf_path, pages="all", lattice=True, multiple_tables=True)
-    except Exception:
-        pass
+    except Exception as e:
+        print("[WARN] Lattice failed:", e)
     try:
         dfs += tabula.read_pdf(pdf_path, pages="all", stream=True, multiple_tables=True, guess=True)
-    except Exception:
-        pass
-
+    except Exception as e:
+        print("[WARN] Stream failed:", e)
     clean = []
     for df in dfs:
         if isinstance(df, pd.DataFrame) and df.size > 0:
@@ -108,23 +103,21 @@ def read_all_tables(pdf_path):
             clean.append(df)
     return clean
 
-# ============== PARSEO FILA A FILA ==============
 def parse_rows(dfs):
     rows = []
     for df in dfs:
         df = df.applymap(tidy_text)
-
         for _, r in df.iterrows():
             cells = [r[c] for c in df.columns]
 
-            # código: primer campo 2–6 dígitos exactos (normalmente a la izquierda)
+            # código
             code = ""
             for c in cells[:3]:
                 if CODE_RE.match(c):
                     code = c
                     break
 
-            # descripción: concatenar celdas con letras (evitar código y números sueltos)
+            # descripción
             text_cells = []
             for c in cells:
                 if CODE_RE.match(c):
@@ -135,10 +128,9 @@ def parse_rows(dfs):
             if not desc:
                 continue
 
-            # precio: último candidato creíble de la fila
+            # precio
             price = last_price_in_row(cells)
             if price is None and desc:
-                # fallback: si el último token del desc es número, úsalo
                 tail = desc.split()[-1]
                 tail_num = normalize_price(tail)
                 if tail_num is not None:
@@ -149,10 +141,10 @@ def parse_rows(dfs):
                 continue
 
             unit = extract_unit(desc)
-            desc = re.sub(r"\s+[.,]00\b", "", desc)  # limpia “.00” colgando
+            desc = re.sub(r"\s+[.,]00\b", "", desc)
             rows.append([code, desc, unit, int(round(price))])
 
-    # de-duplicar manteniendo el primero
+    # de-duplicar
     seen = set()
     unique = []
     for row in rows:
@@ -163,8 +155,8 @@ def parse_rows(dfs):
         unique.append(row)
     return unique
 
-# ============== ESCRITURA EN GOOGLE SHEETS ==============
 def write_to_sheet(rows, creds):
+    print(f"[INFO] Escribiendo {len(rows)} filas a Google Sheets…")
     gc = gspread.authorize(creds)
     sh = gc.open_by_key(SPREADSHEET_ID)
     try:
@@ -174,7 +166,6 @@ def write_to_sheet(rows, creds):
         ws = sh.add_worksheet(title=SHEET_NAME,
                               rows=str(max(len(rows)+10, 100)),
                               cols="4")
-
     header = [["codigo","descripcion","presentacion","precio_final"]]
     ws.update("A1:D1", header)
 
@@ -185,8 +176,8 @@ def write_to_sheet(rows, creds):
             ws.update(f"A{2+i}:D{2+i+len(block)-1}", block)
         ws.format(f"D2:D{len(rows)+1}",
                   {"numberFormat": {"type":"NUMBER","pattern":"#,##0"}})
+    print("[INFO] Listo")
 
-# ============== MAIN ==============
 def main():
     creds = load_creds()
     with tempfile.TemporaryDirectory() as tmp:
@@ -199,7 +190,7 @@ def main():
         rows = parse_rows(dfs)
         print(f"[INFO] FILAS_FINAL={len(rows)}")
 
-        # ordenar por código asc (numéricos primero)
+        # ordenar por código
         def code_key(c):
             try:
                 return int(c)
@@ -207,17 +198,16 @@ def main():
                 return 10**9
         rows.sort(key=lambda r: (code_key(r[0]), r[1]))
 
-        # CSV de respaldo en el workspace del repo (para Actions)
+        # CSV SIEMPRE en el workspace (para artifact)
         workspace = os.getenv("GITHUB_WORKSPACE", os.getcwd())
         csv_path = os.path.join(workspace, "proveedor_extracted.csv")
-        pd.DataFrame(
-            rows,
-            columns=["codigo","descripcion","presentacion","precio_final"]
-        ).to_csv(csv_path, index=False, encoding="utf-8")
+        pd.DataFrame(rows, columns=["codigo","descripcion","presentacion","precio_final"]).to_csv(
+            csv_path, index=False, encoding="utf-8"
+        )
         print(f"[INFO] CSV_SAVED={csv_path}")
 
+        # escribir a Sheets (no falla si 0 filas, solo deja header)
         write_to_sheet(rows, creds)
 
 if __name__ == "__main__":
     main()
-
