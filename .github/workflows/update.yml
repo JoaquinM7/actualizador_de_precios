@@ -25,6 +25,25 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
+          python -V
+          java -version
+
+      - name: Quick import & Tabula env
+        run: |
+          python - << 'PY'
+          import sys
+          print("[INFO] PYTHON", sys.version)
+          try:
+              import tabula, gspread, pandas
+              print("[INFO] Imports OK")
+              try:
+                  tabula.environment_info()
+              except Exception as e:
+                  print("[WARN] tabula.environment_info failed:", e)
+          except Exception as e:
+              print("[ERROR] Import failure:", e)
+              raise
+          PY
 
       - name: Run extractor
         env:
@@ -32,8 +51,10 @@ jobs:
         run: |
           python main.py
 
-      - name: Upload CSV artifact
+      - name: Upload CSV artifact (always)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: proveedor_csv
           path: proveedor_extracted.csv
+          if-no-files-found: warn
