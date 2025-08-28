@@ -1,0 +1,42 @@
+name: Update Price List
+
+on:
+  schedule:
+    - cron: "0 12 * * *"   # 09:00 Argentina ≈ 12:00 UTC
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Java (required by tabula)
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run extractor
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          python main.py | tee run.log
+          ART=$(grep -o 'ARTIFACT_PATH::.*' run.log | sed 's/ARTIFACT_PATH:://')
+          echo "CSV=$ART" >> $GITHUB_ENV
+
+      - name: Upload CSV artifact
+        if: env.CSV != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: proveedor_csv
+          path: ${{ env.CSV }}
