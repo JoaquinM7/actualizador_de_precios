@@ -20,43 +20,50 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
-# ============== REGLAS DE PARSEO ==============
+# ============== REGLAS / REGEX ==============
 CODE_RE  = re.compile(r"^\d{2,6}$")
 UNITS_RE = re.compile(r"\b(\d{1,4})\s*(ml|cc|l|lt|lts|litro?s?|kg|g)\b", re.I)
 PACK_RE  = re.compile(r"x\s*\d+\s*u", re.I)
+HAS_LETTERS_RE = re.compile(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]")
 
 def tidy_text(x: object) -> str:
+    """Normaliza texto de celdas (quita saltos, packs, espacios extras)."""
     if x is None or (isinstance(x, float) and pd.isna(x)):
         return ""
     s = str(x).replace("\n", " ")
-    s = PACK_RE.sub("", s)
+    s = PACK_RE.sub("", s)            # quita “x5u”, “x 12 u”, etc.
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
 def normalize_price(x: object):
+    """Convierte valores a número; descarta ruidos (<100)."""
     if x is None or (isinstance(x, float) and pd.isna(x)):
         return None
     s = str(x).strip()
-    s = re.sub(r"\s+", "", s)                       # "00 700.00" -> "00700.00"
+    s = re.sub(r"\s+", "", s)                    # "00 700.00" -> "00700.00"
     if re.match(r"^\d{1,3}(?:\.\d{3})+$", s):
-        s = s.replace(".", "")                      # "1.234.567" -> "1234567"
+        s = s.replace(".", "")                   # "1.234.567" -> "1234567"
     s = s.replace(",", ".")
     s = re.sub(r"[^\d.]", "", s)
     if not s:
         return None
     try:
         v = float(s)
-        return v if v >= 100 else None
+        return v if v >= 100 else None          # ignoro basura tipo 1, 7, .00
     except Exception:
         return None
 
-def last_price_in_row(cells):
-    vals = []
-    for c in cells:
+def numbers_in_row_with_positions(cells):
+    """Devuelve [(idx, valor_num)] de todos los números creíbles en la fila."""
+    out = []
+    for i, c in enumerate(cells):
         v = normalize_price(c)
         if v is not None:
-            vals.append(v)
-    return vals[-1] if vals else None
+            out.append((i, v))
+    return out
+
+def has_letters(s: str) -> bool:
+    return bool(HAS_LETTERS_RE.search(s or ""))
 
 def extract_unit(text: str) -> str:
     if not text:
@@ -69,6 +76,7 @@ def extract_unit(text: str) -> str:
         u = "lt"
     return f"{n} {u}"
 
+# ============== GOOGLE CREDS / DESCARGA ==============
 def load_creds():
     sa_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
     if not sa_json:
@@ -85,6 +93,7 @@ def download_pdf(path):
         f.write(r.content)
     print("[INFO] PDF descargado OK")
 
+# ============== LECTURA DE TABLAS (todas las páginas) ==============
 def read_all_tables(pdf_path):
     dfs = []
     try:
@@ -100,61 +109,96 @@ def read_all_tables(pdf_path):
         if isinstance(df, pd.DataFrame) and df.size > 0:
             df = df.copy()
             df.columns = [tidy_text(c) for c in df.columns]
+            # pandas >= 2.1: applymap se deprecó, usamos map por columnas
+            for c in df.columns:
+                df[c] = df[c].map(tidy_text)
             clean.append(df)
     return clean
 
+# ============== PARSEO CON FUSIÓN DE FILAS ==============
 def parse_rows(dfs):
     rows = []
+    merged_count = 0
+
     for df in dfs:
-        df = df.applymap(tidy_text)
+        pending = None  # (code, desc, unit) a la espera de precios en la siguiente fila
+
         for _, r in df.iterrows():
             cells = [r[c] for c in df.columns]
+            # Clasificamos fila
+            has_text = any(has_letters(c) for c in cells)
+            nums = numbers_in_row_with_positions(cells)
 
-            # código
+            # Detecto código al inicio si viene
             code = ""
             for c in cells[:3]:
-                if CODE_RE.match(c):
+                if CODE_RE.match(c or ""):
                     code = c
                     break
 
-            # descripción
-            text_cells = []
-            for c in cells:
-                if CODE_RE.match(c):
+            if has_text and nums:
+                # Caso A: descripción y números en la MISMA fila
+                # Regla: precio = último número (derecha)
+                text_cells = []
+                for c in cells:
+                    if CODE_RE.match(c or ""):
+                        continue
+                    if has_letters(c):
+                        text_cells.append(c)
+                desc = " ".join(text_cells).strip()
+                if not desc:
                     continue
-                if re.search(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]", c):
-                    text_cells.append(c)
-            desc = " ".join(text_cells).strip()
-            if not desc:
+                unit = extract_unit(desc)
+                desc = re.sub(r"\s+[.,]00\b", "", desc)
+
+                price = nums[-1][1]  # ÚLTIMO número de la fila
+                rows.append([code, desc, unit, int(round(price))])
+                pending = None
+
+            elif has_text and not nums:
+                # Caso B: descripción sin números -> guardo pendiente
+                text_cells = []
+                for c in cells:
+                    if CODE_RE.match(c or ""):
+                        continue
+                    if has_letters(c):
+                        text_cells.append(c)
+                desc = " ".join(text_cells).strip()
+                if not desc:
+                    continue
+                unit = extract_unit(desc)
+                desc = re.sub(r"\s+[.,]00\b", "", desc)
+                pending = (code, desc, unit)
+
+            elif (not has_text) and nums and pending:
+                # Caso C: fila SOLO con números que sigue a una descripción pendiente
+                # Regla: precio = PRIMER número (izquierda)  -> corrige 500 vs 600
+                price = nums[0][1]
+                pcode, pdesc, punit = pending
+                rows.append([pcode, pdesc, punit, int(round(price))])
+                pending = None
+                merged_count += 1
+
+            else:
+                # Fila sólo números sin pendiente, o basura -> ignorar
                 continue
 
-            # precio
-            price = last_price_in_row(cells)
-            if price is None and desc:
-                tail = desc.split()[-1]
-                tail_num = normalize_price(tail)
-                if tail_num is not None:
-                    price = tail_num
-                    desc = re.sub(r"\s+\d[\d.,]*$", "", desc).strip()
+        # Si quedó un pendiente sin precios, lo ignoramos (sin precio no sirve)
 
-            if price is None:
-                continue
-
-            unit = extract_unit(desc)
-            desc = re.sub(r"\s+[.,]00\b", "", desc)
-            rows.append([code, desc, unit, int(round(price))])
-
-    # de-duplicar
+    # de-duplicar manteniendo (code, desc, price) para no borrar variantes
     seen = set()
     unique = []
-    for row in rows:
-        key = (row[0], row[1])
+    for code, desc, unit, price in rows:
+        key = (code or "", desc, price)
         if key in seen:
             continue
         seen.add(key)
-        unique.append(row)
+        unique.append([code, desc, unit, price])
+
+    print(f"[INFO] Filas fusionadas (desc + precios siguiente fila): {merged_count}")
     return unique
 
+# ============== ESCRITURA EN GOOGLE SHEETS ==============
 def write_to_sheet(rows, creds):
     print(f"[INFO] Escribiendo {len(rows)} filas a Google Sheets…")
     gc = gspread.authorize(creds)
@@ -178,6 +222,7 @@ def write_to_sheet(rows, creds):
                   {"numberFormat": {"type":"NUMBER","pattern":"#,##0"}})
     print("[INFO] Listo")
 
+# ============== MAIN ==============
 def main():
     creds = load_creds()
     with tempfile.TemporaryDirectory() as tmp:
@@ -190,7 +235,7 @@ def main():
         rows = parse_rows(dfs)
         print(f"[INFO] FILAS_FINAL={len(rows)}")
 
-        # ordenar por código
+        # ordenar por código asc (numéricos primero) y luego por descripción
         def code_key(c):
             try:
                 return int(c)
@@ -198,15 +243,14 @@ def main():
                 return 10**9
         rows.sort(key=lambda r: (code_key(r[0]), r[1]))
 
-        # CSV SIEMPRE en el workspace (para artifact)
+        # CSV en workspace para artefacto
         workspace = os.getenv("GITHUB_WORKSPACE", os.getcwd())
         csv_path = os.path.join(workspace, "proveedor_extracted.csv")
-        pd.DataFrame(rows, columns=["codigo","descripcion","presentacion","precio_final"]).to_csv(
-            csv_path, index=False, encoding="utf-8"
-        )
+        pd.DataFrame(
+            rows, columns=["codigo","descripcion","presentacion","precio_final"]
+        ).to_csv(csv_path, index=False, encoding="utf-8")
         print(f"[INFO] CSV_SAVED={csv_path}")
 
-        # escribir a Sheets (no falla si 0 filas, solo deja header)
         write_to_sheet(rows, creds)
 
 if __name__ == "__main__":
